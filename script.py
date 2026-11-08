@@ -26,6 +26,7 @@ RETRY_COUNT = 5
 RUN_EVERY_SECONDS = 30 * 60
 
 ARCHIVE_DIR = Path("./archive_all")
+LATEST_DIR = Path("./latest")
 LOG_DIR = Path("./logs")
 
 PROXIES = None
@@ -139,6 +140,7 @@ IS_TTY = sys.stdout.isatty()
 # ---------------------------------------------------------------- helpers
 def ensure_dirs() -> None:
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    LATEST_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -864,6 +866,34 @@ def _write_b64(path: Path, uris: list[str]) -> None:
     os.replace(tmp, path)
 
 
+def refresh_latest_outputs(stamp: str | None) -> None:
+    """Replace the stable latest/ files with this cycle's output files.
+
+    Missing source files (including cycles that exit before creating a stamp)
+    are written as empty files, so stale results never look current. Each
+    destination is replaced atomically to avoid exposing a partial snapshot.
+    """
+    LATEST_DIR.mkdir(parents=True, exist_ok=True)
+    output_names = (
+        ("working.txt", f"{stamp}_working.txt"),
+        ("working64.txt", f"{stamp}_working_base64.txt"),
+        ("gpass.txt", f"{stamp}_gemini_compatible_working.txt"),
+        ("grpass.txt", f"{stamp}_gemini_reddit_working.txt"),
+    )
+
+    for destination_name, source_name in output_names:
+        source = ARCHIVE_DIR / source_name if stamp else None
+        destination = LATEST_DIR / destination_name
+        content = source.read_bytes() if source is not None and source.is_file() else b""
+        temporary = destination.with_name(destination.name + ".tmp")
+        temporary.write_bytes(content)
+        os.replace(temporary, destination)
+        if source is not None and source.is_file():
+            log(f"Updated latest snapshot: {destination}")
+        else:
+            log(f"Cleared latest snapshot (no output this cycle): {destination}")
+
+
 # ---------------------------------------------------------------- geolocation
 # This stage operates only on the result lists produced by the original checks.
 # It starts Xray again per unique config to identify its actual exit IP, and
@@ -1267,8 +1297,16 @@ def run_geolocation(
 
 # ---------------------------------------------------------------- cycle
 def run_once(use_last_fetch: bool = False) -> None:
+    """Run one cycle and refresh latest/ even when the cycle exits early."""
     ensure_dirs()
+    stamp_holder: list[str] = []
+    try:
+        _run_once(use_last_fetch, stamp_holder)
+    finally:
+        refresh_latest_outputs(stamp_holder[0] if stamp_holder else None)
 
+
+def _run_once(use_last_fetch: bool, stamp_holder: list[str]) -> None:
     # ---- source: fresh fetch OR latest archive ----
     if use_last_fetch:
         src = find_latest_archive()
@@ -1325,6 +1363,7 @@ def run_once(use_last_fetch: bool = False) -> None:
 
     log(f"Total: {len(raw_uris)}  Unique: {len(unique)}")
     stamp = ts_now()
+    stamp_holder.append(stamp)
 
     if not use_last_fetch:
         save_uri_list(ARCHIVE_DIR / f"{stamp}_all_unique.txt", [u for u, _ in unique])
