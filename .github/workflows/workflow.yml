@@ -131,7 +131,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p archive_all logs geolocation
+          mkdir -p archive_all latest logs geolocation
           # Make sure 'script.py' matches your actual Python script filename.
           "$PYTHON_BIN" script.py --once
 
@@ -142,6 +142,16 @@ jobs:
         with:
           name: proxy-archives-${{ github.run_number }}
           path: archive_all/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Stable latest/ snapshots are uploaded independently of the timestamped archives.
+      - name: Upload Latest Proxy Lists
+        if: always() && hashFiles('latest/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-latest-${{ github.run_number }}
+          path: latest/
           if-no-files-found: warn
           retention-days: 14
 
@@ -184,6 +194,14 @@ jobs:
             git add -A -- archive_all/
           fi
 
+          # Always stage the stable latest proxy lists.
+          # -f includes them even if latest/ is accidentally listed in .gitignore.
+          if [[ -d "latest" ]]; then
+            git add -f -A -- latest/
+            echo "Latest proxy lists staged for repository commit."
+            find latest -maxdepth 1 -type f -printf '  %p (%s bytes)\n' || true
+          fi
+
           # Always stage geolocation results.
           # -f ensures that files are included even if geolocation/
           # is accidentally listed in .gitignore.
@@ -219,7 +237,7 @@ jobs:
               fi
             fi
           done < <(
-            git diff --cached --name-only -z -- archive_all/ geolocation/ logs/
+            git diff --cached --name-only -z -- archive_all/ latest/ geolocation/ logs/
           )
 
           echo "Skipped ${skipped_large_files} oversized file(s) from Git staging."
@@ -229,7 +247,7 @@ jobs:
 
           # Commit and push only when there are staged changes.
           if git diff --cached --quiet; then
-            echo "No archive, geolocation, or log changes to commit."
+            echo "No archive, latest-list, geolocation, or log changes to commit."
           else
             git commit -m "🤖 Auto-update proxy lists and geolocation results [skip ci]"
             git push origin "HEAD:${GITHUB_REF_NAME}"
