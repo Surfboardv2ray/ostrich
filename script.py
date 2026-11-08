@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html import unescape
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 
@@ -1216,7 +1216,9 @@ def _geo_exit_ip_for_config(uri: str) -> str | None:
 
 
 def _geo_country_flag(country: str) -> str:
-    return "".join(chr(ord(char) + 127397) for char in country.upper())
+    """Return the flag as UTF-8 percent-encoded text for safe URI storage."""
+    flag = "".join(chr(ord(char) + 127397) for char in country.upper())
+    return quote(flag, safe="")
 
 
 def _geo_replace_remark(uri: str, remark: str) -> str:
