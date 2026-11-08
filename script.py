@@ -895,31 +895,75 @@ def _write_b64(path: Path, uris: list[str]) -> None:
 
 
 def refresh_latest_outputs(stamp: str | None) -> None:
-    """Replace the stable latest/ files with this cycle's output files.
+    """Replace stable latest/ files with the correct source for this cycle.
 
-    Missing source files (including cycles that exit before creating a stamp)
-    are written as empty files, so stale results never look current. Each
-    destination is replaced atomically to avoid exposing a partial snapshot.
+    working.txt, gpass.txt and grpass.txt use their geolocation outputs only
+    when both the master geolocation switch and their individual switch are on.
+
+    If the relevant geolocation switch is off, those files use archive_all.
+    working64.txt always retains its original archive_all source.
+
+    Missing source files are written as empty files, so stale results never
+    look current. Each destination is replaced atomically.
     """
     LATEST_DIR.mkdir(parents=True, exist_ok=True)
-    output_names = (
-        ("working.txt", f"{stamp}_working.txt"),
-        ("working64.txt", f"{stamp}_working_base64.txt"),
-        ("gpass.txt", f"{stamp}_gemini_compatible_working.txt"),
-        ("grpass.txt", f"{stamp}_gemini_reddit_working.txt"),
+
+    use_geo_working = ENABLE_GEOLOCATION and GEOLOCATION_CHECK_WORKING
+    use_geo_gemini = ENABLE_GEOLOCATION and GEOLOCATION_CHECK_GEMINI
+    use_geo_gemini_reddit = ENABLE_GEOLOCATION and GEOLOCATION_CHECK_GEMINI_REDDIT
+
+    output_sources = (
+        (
+            "working.txt",
+            GEOLOCATION_DIR if use_geo_working else ARCHIVE_DIR,
+            f"{stamp}_geolocation.txt" if use_geo_working else f"{stamp}_working.txt",
+        ),
+        (
+            "working64.txt",
+            ARCHIVE_DIR,
+            f"{stamp}_working_base64.txt",
+        ),
+        (
+            "gpass.txt",
+            GEOLOCATION_DIR if use_geo_gemini else ARCHIVE_DIR,
+            (
+                f"{stamp}_gemini_geolocation.txt"
+                if use_geo_gemini
+                else f"{stamp}_gemini_compatible_working.txt"
+            ),
+        ),
+        (
+            "grpass.txt",
+            GEOLOCATION_DIR if use_geo_gemini_reddit else ARCHIVE_DIR,
+            (
+                f"{stamp}_gemini_reddit_geolocation.txt"
+                if use_geo_gemini_reddit
+                else f"{stamp}_gemini_reddit_working.txt"
+            ),
+        ),
     )
 
-    for destination_name, source_name in output_names:
-        source = ARCHIVE_DIR / source_name if stamp else None
+    for destination_name, source_dir, source_name in output_sources:
+        source = source_dir / source_name if stamp else None
         destination = LATEST_DIR / destination_name
-        content = source.read_bytes() if source is not None and source.is_file() else b""
+
+        content = (
+            source.read_bytes()
+            if source is not None and source.is_file()
+            else b""
+        )
+
         temporary = destination.with_name(destination.name + ".tmp")
         temporary.write_bytes(content)
         os.replace(temporary, destination)
+
         if source is not None and source.is_file():
-            log(f"Updated latest snapshot: {destination}")
+            log(f"Updated latest snapshot: {destination} <- {source}")
         else:
-            log(f"Cleared latest snapshot (no output this cycle): {destination}")
+            log(
+                f"Cleared latest snapshot (source missing or no output this cycle): "
+                f"{destination}"
+            )
 
 
 # ---------------------------------------------------------------- geolocation
