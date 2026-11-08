@@ -824,6 +824,29 @@ def render_progress(done: int, total: int, passed: int, failed: int,
     sys.stdout.flush()
 
 
+def render_geolocation_progress(done: int, total: int, label: str,
+                                saved: int, unresolved: int,
+                                start: float) -> None:
+    """Show geolocation progress and how many configs remain in this set."""
+    remaining = total - done
+    elapsed = time.time() - start
+    eta = (elapsed / done) * remaining if done else 0.0
+
+    line = (
+        f"\r  Geolocation {label}: [{done}/{total}]  "
+        f"LEFT {remaining}  SAVED {saved}  UNRESOLVED {unresolved}  "
+        f"ETA {eta:4.0f}s"
+    )
+
+    # Unlike the main test progress, print every geolocation item in non-TTY
+    # environments too (such as GitHub Actions), so the counter remains visible.
+    if IS_TTY:
+        sys.stdout.write(line + "\x1b[K")
+        sys.stdout.flush()
+    else:
+        print(line.lstrip("\r"), flush=True)
+
+
 # ---------------------------------------------------------------- persistence
 def save_uri_list(path: Path, uris: list[str]) -> None:
     path.write_text("\n".join(uris) + ("\n" if uris else ""), encoding="utf-8")
@@ -1203,36 +1226,45 @@ def _geo_save_config_set(configs: list[str], output_path: Path, label: str) -> i
     """Geolocate one tested result set and save only configs with a country."""
     output_count = 0
     unresolved_count = 0
+    total = len(configs)
+    start = time.time()
 
     with output_path.open("w", encoding="utf-8", newline="\n") as out:
-        for uri in configs:
+        for done, uri in enumerate(configs, 1):
             # Geolocate the actual egress IP observed through this config's
             # Xray SOCKS5 tunnel, never the config's server/domain IP.
             ip = _geo_exit_ip_for_config(uri)
             if not ip:
                 unresolved_count += 1
-                continue
+            else:
+                country = _geo_get_country(ip)
+                if not country:
+                    unresolved_count += 1
+                else:
+                    next_count = output_count + 1
+                    remark = (
+                        f"{_geo_country_flag(country)}"
+                        f"{country}_{next_count}_@Surfboardv2ray"
+                    )
 
-            country = _geo_get_country(ip)
-            if not country:
-                unresolved_count += 1
-                continue
+                    try:
+                        converted = _geo_replace_remark(uri, remark)
+                    except Exception as exc:
+                        unresolved_count += 1
+                        log(f"Geolocation remark update failed for {uri[:90]}: {exc}")
+                    else:
+                        out.write(converted + "\n")
+                        output_count = next_count
 
-            next_count = output_count + 1
-            remark = (
-                f"{_geo_country_flag(country)}"
-                f"{country}_{next_count}_@Surfboardv2ray"
+            # Count every config, including failed/unresolved configs, so LEFT
+            # always reflects the number of checks still to be processed.
+            render_geolocation_progress(
+                done, total, label, output_count, unresolved_count, start
             )
 
-            try:
-                converted = _geo_replace_remark(uri, remark)
-            except Exception as exc:
-                unresolved_count += 1
-                log(f"Geolocation remark update failed for {uri[:90]}: {exc}")
-                continue
-
-            out.write(converted + "\n")
-            output_count = next_count
+    if IS_TTY and total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     log(
         f"Geolocation {label}: saved {output_count} configs to {output_path} "
