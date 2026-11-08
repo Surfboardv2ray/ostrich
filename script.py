@@ -39,7 +39,7 @@ TEST_ENDPOINTS = [
     "https://captive.apple.com",
 ]
 TEST_TIMEOUT = 1
-TEST_WORKERS = 80
+TEST_WORKERS = 200
 
 # ---- Gemini and Reddit compatibility checks ----
 # Only run against configs that already passed all TEST_ENDPOINTS above.
