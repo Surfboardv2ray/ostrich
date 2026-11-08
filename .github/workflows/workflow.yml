@@ -1,0 +1,236 @@
+
+name: Auto Update Proxies
+
+on:
+  # Runs every 6 hours. Scheduled runs do not retain error logs by default.
+  schedule:
+    - cron: '0 */6 * * *'
+
+  # Manual runs expose an ON/OFF checkbox for retaining error logs.
+  workflow_dispatch:
+    inputs:
+      save_error_logs:
+        description: 'Save error logs to the repository and as a downloadable artifact'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  update:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    # Manual runs follow the checkbox. Scheduled runs leave error-log retention OFF.
+    env:
+      SAVE_ERROR_LOGS: ${{ github.event_name == 'workflow_dispatch' && inputs.save_error_logs }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ubuntu-22.04 includes system Python 3.10. Use it directly instead
+      # of actions/setup-python, which downloads Python from GitHub Releases
+      # and can fail when that asset endpoint returns HTTP 504.
+      - name: Verify Runner Python
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PYTHON_BIN="$(command -v python3)"
+          "$PYTHON_BIN" - <<'PYTHON_CHECK'
+          import sys
+          if sys.version_info[:2] != (3, 10):
+              raise SystemExit(
+                  f"Expected Python 3.10 on ubuntu-22.04, found {sys.version.split()[0]}"
+              )
+          print(f"Using runner Python {sys.version.split()[0]}")
+          PYTHON_CHECK
+          echo "PYTHON_BIN=$PYTHON_BIN" >> "$GITHUB_ENV"
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Requests needs the optional PySocks package for socks5h:// proxies.
+          # Check BOTH imports: requests may already exist while SOCKS support
+          # is missing, which caused the original runtime failure.
+          if ! "$PYTHON_BIN" -c 'import requests, socks' >/dev/null 2>&1; then
+            "$PYTHON_BIN" -m pip install --user --disable-pip-version-check --no-input 'requests[socks]'
+          fi
+
+          # Fail here with a clear message if the optional SOCKS dependency
+          # was not made available to the same Python interpreter as the script.
+          "$PYTHON_BIN" - <<'PYTHON_CHECK'
+          import requests
+          import socks
+          print("requests", requests.__version__)
+          print("PySocks", getattr(socks, "__version__", "installed"))
+          PYTHON_CHECK
+
+      - name: Install Xray Core
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Use XTLS's official GHCR image instead of downloading the release ZIP.
+          # This bypasses the GitHub Releases asset/CDN endpoint that returned 504.
+          image="ghcr.io/xtls/xray-core:latest"
+          work_dir="$(mktemp -d)"
+          container_id=""
+          cleanup() {
+            if [[ -n "$container_id" ]]; then
+              docker rm -f "$container_id" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$work_dir"
+          }
+          trap cleanup EXIT
+
+          command -v docker >/dev/null
+
+          # Retry transient GHCR/network failures with increasing delays.
+          pulled=false
+          for attempt in 1 2 3 4 5; do
+            if docker pull --platform linux/amd64 "$image"; then
+              pulled=true
+              break
+            fi
+
+            if (( attempt < 5 )); then
+              delay=$((attempt * 10))
+              echo "GHCR pull failed (attempt ${attempt}/5); retrying in ${delay}s..."
+              sleep "$delay"
+            fi
+          done
+
+          if [[ "$pulled" != true ]]; then
+            echo "ERROR: Could not pull the official Xray image: ${image}"
+            exit 1
+          fi
+
+          # Create (but do not start) a container and copy the binary out. The
+          # official image is minimal and does not need to contain a shell.
+          container_id="$(docker create --platform linux/amd64 "$image")"
+          docker cp "${container_id}:/usr/local/bin/xray" "$work_dir/xray"
+          docker rm "$container_id" >/dev/null
+          container_id=""
+
+          chmod 0755 "$work_dir/xray"
+          version_output="$("$work_dir/xray" version 2>&1)"
+          printf '%s\n' "$version_output"
+
+          if ! grep --extended-regexp --quiet '^Xray [0-9]' <<<"$version_output"; then
+            echo "ERROR: The binary copied from the official image did not report a valid Xray version."
+            exit 1
+          fi
+
+          sudo install -m 0755 "$work_dir/xray" /usr/local/bin/xray
+          xray version
+
+      - name: Run Script
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p archive_all logs geolocation
+          # Make sure 'script.py' matches your actual Python script filename.
+          "$PYTHON_BIN" script.py --once
+
+      # Archive outputs are always uploaded, regardless of the error-log toggle.
+      - name: Upload Proxy Archives
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-archives-${{ github.run_number }}
+          path: archive_all/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Geolocation results are uploaded independently of the error-log toggle.
+      # Skip this step cleanly when geolocation is disabled or produces no files.
+      - name: Upload Geolocation Results
+        if: always() && hashFiles('geolocation/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-geolocation-${{ github.run_number }}
+          path: geolocation/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Error logs are uploaded only when the toggle is ON.
+      # Oversized files are still included here; the size limit below applies only to Git commits.
+      - name: Upload Error Logs
+        if: always() && env.SAVE_ERROR_LOGS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-error-logs-${{ github.run_number }}
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      - name: Commit and Push Results
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+
+          # GitHub rejects individual Git files at 100 MB.
+          MAX_GIT_FILE_SIZE_BYTES=$((90 * 1024 * 1024))
+
+          # Always stage proxy archives.
+          if [[ -d "archive_all" ]]; then
+            git add -A -- archive_all/
+          fi
+
+          # Always stage geolocation results.
+          # -f ensures that files are included even if geolocation/
+          # is accidentally listed in .gitignore.
+          if [[ -d "geolocation" ]]; then
+            git add -f -A -- geolocation/
+            echo "Geolocation results staged for repository commit."
+            find geolocation -maxdepth 1 -type f -printf '  %p (%s bytes)\n' || true
+          fi
+
+          # Save logs to the repository only when the toggle is ON.
+          if [[ "$SAVE_ERROR_LOGS" == "true" ]]; then
+            if [[ -d "logs" ]]; then
+              git add -A -- logs/
+            fi
+            echo "Error-log saving is ON."
+          else
+            echo "Error-log saving is OFF. Logs will not be committed."
+          fi
+
+          # Remove oversized files from Git staging.
+          # They remain available through the previously uploaded artifacts.
+          skipped_large_files=0
+
+          while IFS= read -r -d '' staged_file; do
+            if [[ -f "$staged_file" ]]; then
+              file_size="$(stat -c '%s' -- "$staged_file")"
+
+              if (( file_size > MAX_GIT_FILE_SIZE_BYTES )); then
+                echo "::warning file=${staged_file}::Skipping Git commit: file is ${file_size} bytes (limit ${MAX_GIT_FILE_SIZE_BYTES}). It remains available in the workflow artifact."
+
+                git restore --staged -- "$staged_file"
+                skipped_large_files=$((skipped_large_files + 1))
+              fi
+            fi
+          done < <(
+            git diff --cached --name-only -z -- archive_all/ geolocation/ logs/
+          )
+
+          echo "Skipped ${skipped_large_files} oversized file(s) from Git staging."
+
+          echo "Files staged for commit:"
+          git diff --cached --name-status
+
+          # Commit and push only when there are staged changes.
+          if git diff --cached --quiet; then
+            echo "No archive, geolocation, or log changes to commit."
+          else
+            git commit -m "🤖 Auto-update proxy lists and geolocation results [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
