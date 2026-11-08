@@ -95,7 +95,12 @@ GEOLOCATION_CHECK_GEMINI = False
 GEOLOCATION_CHECK_GEMINI_REDDIT = True
 
 GEOLOCATION_DIR = Path("./geolocation")
-GEOLOCATION_DATABASE_FILE = Path("./databases/dbip-country-lite.mmdb")
+# Resolve the database relative to this script, not the process's current
+# working directory. This keeps the expected databases/ path reliable when
+# launched by GitHub Actions, a scheduler, or another directory.
+GEOLOCATION_DATABASE_FILE = (
+    Path(__file__).resolve().parent / "databases" / "dbip-country-lite.mmdb"
+)
 GEOLOCATION_REQUEST_DELAY = 1.5
 GEOLOCATION_MAX_API_ERRORS = 3
 GEOLOCATION_API_SERVICES = [
@@ -967,6 +972,7 @@ def _geo_database_reader():
         import maxminddb
 
         _GEO_DB_READER = maxminddb.open_database(str(GEOLOCATION_DATABASE_FILE))
+        log(f"Loaded local DB-IP country database: {GEOLOCATION_DATABASE_FILE}")
     except ImportError:
         log("maxminddb is not installed; geolocation will use API services instead.")
     except Exception as exc:
@@ -976,6 +982,7 @@ def _geo_database_reader():
 
 
 def _geo_lookup_local_database(ip: str) -> str | None:
+    """Return the country code from the local DB-IP database, if present."""
     reader = _geo_database_reader()
     if reader is None:
         return None
@@ -985,9 +992,10 @@ def _geo_lookup_local_database(ip: str) -> str | None:
         if not result:
             return None
 
-        country = result.get("country", {}).get("iso_code")
-        if isinstance(country, str) and len(country) == 2:
-            return country.upper()
+        country_data = result.get("country") or {}
+        country = country_data.get("iso_code") if isinstance(country_data, dict) else None
+        if isinstance(country, str) and len(country.strip()) == 2:
+            return country.strip().upper()
     except Exception as exc:
         log(f"Geolocation database lookup failed for {ip}: {exc}")
 
@@ -1066,10 +1074,13 @@ def _geo_get_country(ip: str) -> str | None:
         _GEO_COUNTRY_CACHE[ip] = None
         return None
 
+    # First try the offline DB-IP database. APIs are used only if this lookup
+    # cannot return a two-letter country code (or the database is unavailable).
     log(f"Geolocation local database lookup: {ip}")
     country = _geo_lookup_local_database(ip)
 
     if country:
+        log(f"Geolocation local database result: {ip} -> {country}")
         _GEO_COUNTRY_CACHE[ip] = country
         return country
 
