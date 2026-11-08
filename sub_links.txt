@@ -1,1 +1,1 @@
-https://raw.githubusercontent.com/Surfboardv2ray/Proxy-sorter/main/output/converted.txt
+https://raw.githubusercontent.com/Surfboardv2ray/Proxy-sorter/refs/heads/main/selector/random.txt
